@@ -448,29 +448,46 @@ export class SeiDepositMonitor {
     return data.tx_responses || [];
   }
 
-  // ------------------------------------------
-  //     Parsing transaction logs
-  // ------------------------------------------
-  private parseTransactionDetails(tx: TxResponseItem): TransactionDetails[] {
+ // ------------------------------------------
+//     Parsing transaction logs
+// ------------------------------------------
+private parseTransactionDetails(tx: TxResponseItem): TransactionDetails[] {
     this.logger.trace('parseTransactionDetails =>', tx);
     const depositDetails: TransactionDetails[] = [];
-
-    // logs from REST or might be undefined
-    const logs = tx.logs || [];
-
-    // WS data might have tx.result, so cast or safely check:
-    if (!logs.length && tx.result?.events) {
-      logs.push({
-        msg_index: 0,
-        log: '',
-        events: tx.result.events
-      });
+  
+    // Start with whatever logs we might have from REST
+    let logs = tx.logs || [];
+  
+    /**
+     * If logs is empty, check for:
+     * - top-level `tx.events` (the shape your test uses),
+     * - WS-based `tx.result?.events`.
+     */
+    if (!logs.length) {
+      if (tx.events?.length) {
+        logs = [
+          {
+            msg_index: 0,
+            log: '',
+            events: tx.events
+          }
+        ];
+      } else if (tx.result?.events?.length) {
+        logs = [
+          {
+            msg_index: 0,
+            log: '',
+            events: tx.result.events
+          }
+        ];
+      }
     }
-
+  
+    // Now `logs` may have at least one entry if events exist
     for (const log of logs) {
       const events = log.events || [];
-
-      // identify messageType /cosmos.bank... or /seiprotocol.seichain.evm...
+  
+      // Identify the message type => e.g. '/cosmos.bank.v1beta1.MsgSend' or '/seiprotocol.seichain.evm.MsgEVMTransaction'
       let actionType = 'unknown';
       const messageEvent = events.find((e) => e.type === 'message');
       if (messageEvent) {
@@ -479,21 +496,22 @@ export class SeiDepositMonitor {
           actionType = actionAttr.value;
         }
       }
-
-      // coin_received (may include multiple pairs)
+  
+      // Look for coin_received events
       const coinReceivedEvents = events.filter((e) => e.type === 'coin_received');
       for (const cre of coinReceivedEvents) {
         const attrs = cre.attributes || [];
-        // multiple (receiver, amount) pairs in a single coin_received
+        // Each coin_received can have multiple (receiver, amount) pairs
         for (let i = 0; i < attrs.length; i += 2) {
           const receiverAttr = attrs[i];
           const amountAttr = attrs[i + 1];
           if (!receiverAttr || !amountAttr) continue;
           if (receiverAttr.key !== 'receiver' || amountAttr.key !== 'amount') continue;
-
+  
           const receiver = receiverAttr.value;
           const amount = amountAttr.value;
-
+  
+          // If this matches our finalAddress, it's a deposit
           if (receiver === this.finalAddress) {
             const detail: TransactionDetails = {
               hash: tx.txhash,
@@ -512,25 +530,29 @@ export class SeiDepositMonitor {
         }
       }
     }
-
+  
     return depositDetails;
   }
-
+  
+  /**
+   * Helper to extract 'sender' from events (via 'message' or 'transfer').
+   */
   private extractSender(events: TxLogEvent[]): string | undefined {
-    // check 'message' or 'transfer' for desired attribute key(s)
     const msgEvent = events.find((e) => e.type === 'message');
     if (msgEvent) {
       const senderAttr = msgEvent.attributes.find((a) => a.key === 'sender');
       if (senderAttr) return senderAttr.value;
     }
+  
     const transferEvent = events.find((e) => e.type === 'transfer');
     if (transferEvent) {
       const senderAttr = transferEvent.attributes.find((a) => a.key === 'sender');
       if (senderAttr) return senderAttr.value;
     }
+  
     return undefined;
   }
-
+  
   /**
    * Determine deposit type: 'evm', 'direct', or 'cast'
    *
