@@ -3,7 +3,6 @@
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
 import {
-    NetworkConfig,
     MonitorConfig,
     DepositCallback,
     DepositEvent,
