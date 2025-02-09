@@ -4,10 +4,15 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "license": "MIT",
+  "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node demo-script.ts",
-    "watch": "ts-node-dev --respawn demo-script.ts"
+    "clean": "rm -rf dist coverage",
+    "start": "tsx examples/simple-monitor.ts",
+    "dev": "tsx watch examples/simple-monitor.ts",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
+    "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage"
   },
   "dependencies": {
     "@noble/curves": "^1.3.0",
@@ -17,11 +22,15 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/jest": "^29.5.11",
     "@types/node": "^20.11.5",
     "@types/ws": "^8.5.10",
-    "ts-node": "^10.9.2",
-    "ts-node-dev": "^2.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "tsx": "^4.7.0",
     "typescript": "^5.3.3"
   },
-  "type": "module"
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
