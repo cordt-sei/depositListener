@@ -8,12 +8,12 @@
   "scripts": {
     "build": "tsc",
     "clean": "rm -rf dist coverage",
-    "start": "tsx examples/simple-monitor.ts",
-    "dev": "tsx watch examples/simple-monitor.ts",
+    "start": "tsx examples/demo.ts",
+    "dev": "tsx watch examples/demo.ts",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test:unit": "NODE_OPTIONS=--experimental-vm-modules jest",
     "test:integration": "tsx ./src/__tests__/connTest.ts",
-    "test:e2e": "tsx examples/simple-monitor.ts",
+    "test:e2e": "tsx examples/demo.ts",
     "prepublishOnly": "yarn clean && yarn build && yarn test:unit"
   },
   "dependencies": {
