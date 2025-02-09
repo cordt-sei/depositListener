@@ -1,8 +1,7 @@
 // src/address.ts
+
 import { sha256 } from '@noble/hashes/sha256';
 import { ripemd160 } from '@noble/hashes/ripemd160';
-import { keccak_256 } from '@noble/hashes/sha3';
-import { secp256k1 } from '@noble/curves/secp256k1';
 import { bech32 } from 'bech32';
 
 export class AddressUtils {
@@ -36,7 +35,6 @@ export class AddressUtils {
         let pubKeyBytes: Uint8Array;
         
         if (typeof publicKey === 'string') {
-            // Handle both hex and base64
             try {
                 if (publicKey.startsWith('0x')) {
                     pubKeyBytes = Uint8Array.from(Buffer.from(publicKey.slice(2), 'hex'));
@@ -45,8 +43,9 @@ export class AddressUtils {
                 } else {
                     pubKeyBytes = Uint8Array.from(Buffer.from(publicKey, 'base64'));
                 }
-            } catch (e) {
-                throw new Error(`Invalid public key format: ${e.message}`);
+            } catch (error: unknown) {
+                const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+                throw new Error(`Invalid public key format: ${errorMessage}`);
             }
         } else {
             pubKeyBytes = publicKey;
@@ -60,11 +59,29 @@ export class AddressUtils {
     }
 
     static ethAddressToBech32(ethAddress: string, prefix: string): string {
+        // Validate ETH address format first
+        if (!this.isEthAddress(ethAddress)) {
+            throw new Error('Invalid ETH address format');
+        }
+
         // Remove '0x' prefix if present and convert to Buffer
-        const addressBytes = Buffer.from(ethAddress.replace('0x', ''), 'hex');
-        const words = this.convertBits(addressBytes, 8, 5, true);
-        
-        return bech32.encode(prefix, words, 256);
+        try {
+            const cleanAddress = ethAddress.replace('0x', '').toLowerCase();
+            if (!/^[0-9a-f]{40}$/.test(cleanAddress)) {
+                throw new Error('Invalid ETH address characters');
+            }
+            
+            const addressBytes = Buffer.from(cleanAddress, 'hex');
+            if (addressBytes.length !== 20) {
+                throw new Error('Invalid ETH address length');
+            }
+            
+            const words = this.convertBits(addressBytes, 8, 5, true);
+            return bech32.encode(prefix, words, 256);
+        } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            throw new Error(`Invalid ETH address: ${errorMessage}`);
+        }
     }
 
     static isEthAddress(address: string): boolean {

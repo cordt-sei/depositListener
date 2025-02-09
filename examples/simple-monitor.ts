@@ -1,11 +1,11 @@
 // demo.ts
-import { SeiDepositMonitor, DepositEvent } from './src';
+import { SeiDepositMonitor, DepositEvent } from '../dist';
 
 async function main() {
     // Initialize the monitor
     const monitor = new SeiDepositMonitor(
         {
-            wsEndpoint: 'wss://ws.sei.basementnodes.ca',
+            wsEndpoint: 'wss://ws.sei.basementnodes.ca/websocket',
             restEndpoint: 'https://api.sei.basementnodes.ca',
             prefix: 'sei'
         },

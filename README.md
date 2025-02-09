@@ -30,7 +30,7 @@ import { SeiDepositMonitor } from 'deposit-listener';
 
 // Initialize the monitor
 const monitor = new SeiDepositMonitor({
-    wsEndpoint: 'wss://ws.sei.basementnodes.ca',
+    wsEndpoint: 'wss://ws.sei.basementnodes.ca/websocket',
     restEndpoint: 'https://api.sei.basementnodes.ca',
     prefix: 'sei'
 }, 'sei1qv45ek49hqupx63u8lme9vcylarj3qe7f7cy99');
@@ -48,42 +48,6 @@ monitor.onDeposit((event) => {
 await monitor.start();
 ```
 
-## Deposit Types
-
-### 1. Direct Transfers
-Standard bank send transactions using the Cosmos SDK.
-
-### 2. EVM Transactions
-Transfers originating from the Sei EVM environment.
-
-### 3. Cast Address Deposits
-Special case for new accounts where:
-- The deposit is made to a hex address that hasn't been used
-- Funds are held by a "cast" address until the first transaction
-- The library automatically monitors both the target and cast addresses
-
-## API Reference
-
-### SeiDepositMonitor
-
-#### Constructor
-```typescript
-constructor(config: NetworkConfig, targetAddress: string)
-```
-
-#### Methods
-- `start(): Promise<void>` - Start monitoring for deposits
-- `stop(): void` - Stop monitoring
-- `onDeposit(callback: DepositCallback): void` - Register deposit handler
-- `removeCallback(callback: DepositCallback): void` - Remove deposit handler
-
-### AddressUtils
-
-Static utility methods for address manipulation:
-- `pubKeyToAddress(publicKey: Uint8Array | string, prefix: string): string`
-- `ethAddressToBech32(ethAddress: string, prefix: string): string`
-- `isEthAddress(address: string): boolean`
-
 ## Development
 
 ```bash
@@ -93,27 +57,41 @@ yarn install
 # Build
 yarn build
 
-# Run tests
-yarn test
+# Run unit tests
+yarn test:unit
 
-# Run demo
-yarn start
+# Run integration tests (requires network connection)
+yarn test:integration
+
+# Run end-to-end demo
+yarn test:e2e
 
 # Development with auto-reload
-yarn watch
+yarn dev
 ```
 
-## Testing
+## Testing Strategy
 
-The library includes a comprehensive test suite:
+The library employs a three-layer testing approach:
 
-```bash
-# Run all tests
-yarn test
+1. **Unit Tests** (`yarn test:unit`): Tests core logic:
 
-# Run with coverage
-yarn test --coverage
-```
+   - Address conversion and validation
+   - Transaction type determination
+   - Configuration handling
+   - Event parsing logic
+
+2. **Integration Tests** (`yarn test:integration`):
+
+   - Tests actual WebSocket connectivity
+   - Verifies subscription functionality
+   - Checks network endpoint availability
+
+3. **End-to-End Testing** (`yarn test:e2e`):
+
+   - Runs a complete demo setup
+   - Monitors real network activity
+   - Validates full deposit detection pipeline
 
 ## Type Definitions
 
@@ -145,6 +123,7 @@ interface DepositEvent {
 ## Error Handling
 
 The library implements comprehensive error handling:
+
 - Automatic WebSocket reconnection
 - REST API fallback
 - Transaction parsing error recovery

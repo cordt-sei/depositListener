@@ -1,10 +1,6 @@
-// src/__tests__/monitor.test.ts
-import { SeiDepositMonitor, AddressUtils } from '../index';
-import WebSocket from 'ws';
-
-// Mock WebSocket
-jest.mock('ws');
-jest.mock('node-fetch');
+import { jest, expect, describe, test } from '@jest/globals';
+import { SeiDepositMonitor, AddressUtils } from '../index.js';
+import type { TransactionDetails } from '../types.js';
 
 describe('SeiDepositMonitor', () => {
     const config = {
@@ -14,79 +10,98 @@ describe('SeiDepositMonitor', () => {
     };
     const targetAddress = 'sei1qv45ek49hqupx63u8lme9vcylarj3qe7f7cy99';
 
-    beforeEach(() => {
-        jest.clearAllMocks();
+    test('properly formats WebSocket endpoint', () => {
+        const monitor1 = new SeiDepositMonitor({
+            ...config,
+            wsEndpoint: 'wss://ws.test.com'
+        }, targetAddress);
+
+        const monitor2 = new SeiDepositMonitor({
+            ...config,
+            wsEndpoint: 'wss://ws.test.com/websocket'
+        }, targetAddress);
+
+        const config1 = (monitor1 as any).config;
+        const config2 = (monitor2 as any).config;
+
+        expect(config1.wsEndpoint).toBe('wss://ws.test.com/websocket');
+        expect(config2.wsEndpoint).toBe('wss://ws.test.com/websocket');
     });
 
     test('initializes with correct configuration', () => {
         const monitor = new SeiDepositMonitor(config, targetAddress);
         expect(monitor).toBeDefined();
+        expect((monitor as any).targetAddress).toBe(targetAddress);
     });
 
-    test('handles WebSocket connection correctly', async () => {
+    test('correctly identifies deposit types', () => {
         const monitor = new SeiDepositMonitor(config, targetAddress);
-        const mockWs = new WebSocket(null);
         
-        // Start monitoring
-        await monitor.start();
-
-        // Verify WebSocket connection
-        expect(WebSocket).toHaveBeenCalledWith(expect.stringContaining(config.wsEndpoint));
+        // Access private method for testing
+        const determineDepositType = (monitor as any).determineDepositType.bind(monitor);
         
-        // Simulate WebSocket open event
-        mockWs.emit('open');
-        
-        // Verify subscription message
-        expect(mockWs.send).toHaveBeenCalledWith(
-            expect.stringContaining('tm.event=\'Tx\'')
-        );
-    });
-
-    test('processes deposit events correctly', async () => {
-        const monitor = new SeiDepositMonitor(config, targetAddress);
-        const mockCallback = jest.fn();
-        
-        monitor.onDeposit(mockCallback);
-        await monitor.start();
-
-        const mockWs = new WebSocket(null);
-        const mockTxEvent = {
-            result: {
-                data: {
-                    value: {
-                        TxResult: {
-                            height: '123456',
-                            hash: 'ABC123',
-                            gas_used: '50000',
-                            gas_wanted: '75000',
-                            logs: [{
-                                events: [{
-                                    type: 'coin_received',
-                                    attributes: [
-                                        { key: 'receiver', value: targetAddress },
-                                        { key: 'amount', value: '100000usei' }
-                                    ]
-                                }]
-                            }]
-                        }
-                    }
-                }
-            }
+        const directTx: TransactionDetails = {
+            hash: 'abc',
+            height: '123',
+            type: '/cosmos.bank.v1beta1.MsgSend',
+            amount: '100usei',
+            receiver: targetAddress,
+            gasUsed: '50000',
+            gasWanted: '75000',
+            timestamp: '2024-02-09T12:00:00Z'
         };
 
-        // Simulate receiving transaction event
-        mockWs.emit('message', JSON.stringify(mockTxEvent));
+        const evmTx: TransactionDetails = {
+            ...directTx,
+            type: '/seiprotocol.seichain.evm.MsgEVMTransaction'
+        };
 
-        // Verify callback was called with correct data
-        expect(mockCallback).toHaveBeenCalledWith(
-            expect.objectContaining({
-                type: 'direct',
-                transaction: expect.objectContaining({
-                    hash: 'ABC123',
-                    amount: '100000usei'
-                })
-            })
-        );
+        const castTx: TransactionDetails = {
+            ...directTx,
+            receiver: (monitor as any).castAddress
+        };
+
+        expect(determineDepositType(directTx)).toBe('direct');
+        expect(determineDepositType(evmTx)).toBe('evm');
+        if ((monitor as any).castAddress) {
+            expect(determineDepositType(castTx)).toBe('cast');
+        }
+    });
+
+    test('parses transaction details correctly', () => {
+        const monitor = new SeiDepositMonitor(config, targetAddress);
+        const parseTransactionDetails = (monitor as any).parseTransactionDetails.bind(monitor);
+
+        const mockTx = {
+            txhash: 'abc123',
+            height: '123456',
+            gas_used: '50000',
+            gas_wanted: '75000',
+            timestamp: '2024-02-09T12:00:00Z',
+            events: [
+                {
+                    type: 'coin_received',
+                    attributes: [
+                        { key: 'receiver', value: targetAddress },
+                        { key: 'amount', value: '100usei' }
+                    ]
+                },
+                {
+                    type: 'message',
+                    attributes: [
+                        { key: 'action', value: '/cosmos.bank.v1beta1.MsgSend' },
+                        { key: 'sender', value: 'sei1sender' }
+                    ]
+                }
+            ]
+        };
+
+        const result = parseTransactionDetails(mockTx);
+        expect(result).toBeDefined();
+        expect(result?.hash).toBe('abc123');
+        expect(result?.amount).toBe('100usei');
+        expect(result?.receiver).toBe(targetAddress);
+        expect(result?.sender).toBe('sei1sender');
     });
 });
 
@@ -106,5 +121,21 @@ describe('AddressUtils', () => {
     test('detects eth addresses correctly', () => {
         expect(AddressUtils.isEthAddress('0x7b3D6e9756fe4FbdED6881065882323A8C6d9B1A')).toBe(true);
         expect(AddressUtils.isEthAddress('sei1qv45ek49hqupx63u8lme9vcylarj3qe7f7cy99')).toBe(false);
+    });
+
+    test('handles invalid eth addresses', () => {
+        expect(() => AddressUtils.ethAddressToBech32('invalid', 'sei')).toThrow();
+        expect(() => AddressUtils.ethAddressToBech32('0xinvalid', 'sei')).toThrow();
+    });
+
+    test('handles different public key formats', () => {
+        const hexPubKey = '02a9c4ec5e7927c1390a769a1c6ce4c54bda30677676ff3ab32b905d75dcff1960';
+        const base64PubKey = Buffer.from(hexPubKey, 'hex').toString('base64');
+        
+        const hexAddress = AddressUtils.pubKeyToAddress(hexPubKey, 'sei');
+        const base64Address = AddressUtils.pubKeyToAddress(base64PubKey, 'sei');
+        
+        expect(hexAddress).toBe(base64Address);
+        expect(hexAddress).toMatch(/^sei1/);
     });
 });

@@ -1,4 +1,5 @@
 // src/types.ts
+
 export interface NetworkConfig {
     wsEndpoint: string;
     restEndpoint: string;
