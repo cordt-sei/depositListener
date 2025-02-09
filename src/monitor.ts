@@ -2,10 +2,20 @@
 
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
-import { NetworkConfig, DepositCallback, DepositEvent, TransactionDetails } from './types';
+import {
+    NetworkConfig,
+    MonitorConfig,
+    DepositCallback,
+    DepositEvent,
+    TransactionDetails,
+    JsonRpcResponse
+  } from './types';
 import { AddressUtils } from './address';
 import { Logger, LogLevel, LogOptions } from './logger';
 
+/**
+ * The shape of the block/latest response
+ */
 interface BlockResponse {
   block: {
     header: {
@@ -14,89 +24,125 @@ interface BlockResponse {
   };
 }
 
+/**
+ * Log events from the chain's transaction logs
+ */
+interface TxLogEvent {
+  type: string;
+  attributes: Array<{ key: string; value: string }>;
+}
+
+interface TxLog {
+  msg_index: number;
+  log: string;
+  events: TxLogEvent[];
+}
+
+/**
+ * A single transaction response item from the REST or WS
+ */
+interface TxResponseItem {
+  txhash: string;
+  height: string;
+  gas_used: string;
+  gas_wanted: string;
+  timestamp: string;
+  logs?: TxLog[];
+  events?: TxLogEvent[];
+  /**
+   * Some WS data includes a `result` object with `events`; we handle it carefully.
+   */
+  result?: {
+    events?: TxLogEvent[];
+  };
+}
+
+/**
+ * The shape of the /txs?events= response
+ */
 interface TxResponse {
-  tx_responses?: Array<{
-    txhash: string;
-    height: string;
-    gas_used: string;
-    gas_wanted: string;
-    timestamp: string;
-    logs?: Array<{
-      msg_index: number;
-      log: string;
-      events: Array<{
-        type: string;
-        attributes: Array<{
-          key: string;
-          value: string;
-        }>;
-      }>;
-    }>;
-    events?: Array<{
-      type: string;
-      attributes: Array<{
-        key: string;
-        value: string;
-      }>;
-    }>;
-  }>;
+  tx_responses?: TxResponseItem[];
 }
 
-export interface MonitorConfig extends NetworkConfig {
-  logLevel?: LogLevel;
+/**
+ * associated wallet lookup - wallets.sei.basementnodes.ca/<0x> response
+ */
+interface WalletsLookup {
+  original: string;
+  result: string;
 }
 
+/**
+ * The main deposit monitor class.
+ *
+ * This class monitors for incoming deposits to a given address (bech32 or hex).
+ * - If given a bech32 address, it monitors directly for `coin_received.receiver = address`.
+ * - If given a hex address (0x):
+ *    1) Checks if it's a smart contract => cast to bech32
+ *    2) If it's an EOA with no transactions => “cast address” until first TX
+ *    3) If the chain knows the final bech32 => use that
+ */
 export class SeiDepositMonitor {
   private config: MonitorConfig;
   private ws: WebSocket | null = null;
   private callbacks: Set<DepositCallback> = new Set();
   private isMonitoring: boolean = false;
   private reconnectTimeout: NodeJS.Timeout | null = null;
-  private targetAddress: string;
-  private castAddress: string | null = null;
   private logger: Logger;
 
+  // original address (bech32 or 0x)
+  private targetAddress: string;
+
+  // final address wanted in coin_received => always bech32
+  private finalAddress: string;
+
   constructor(config: MonitorConfig, targetAddress: string) {
+    // normalize the WebSocket endpoint
     this.config = {
       ...config,
       wsEndpoint: this.normalizeWsEndpoint(config.wsEndpoint)
     };
     this.targetAddress = targetAddress;
+    this.finalAddress = targetAddress; // will be overridden if 0x
 
-    // Initialize logger
+    // Setup logger
+    const level = config.logLevel ?? LogLevel.INFO;
     const logOptions: LogOptions = {
-      level: config.logLevel || LogLevel.INFO,
+      level,
       prefix: 'SeiMonitor',
       timestamp: true
     };
     this.logger = new Logger(logOptions);
-
-    // If the target address is an ETH address, calculate its cast address
-    if (AddressUtils.isEthAddress(targetAddress)) {
-      this.castAddress = AddressUtils.ethAddressToBech32(targetAddress, config.prefix);
-      this.logger.info(`Monitoring cast address: ${this.castAddress}`);
-    }
   }
 
   private normalizeWsEndpoint(endpoint: string): string {
     return endpoint.endsWith('/websocket') ? endpoint : `${endpoint}/websocket`;
   }
 
+  /**
+   * Add a callback to be notified on new deposits
+   */
   public onDeposit(callback: DepositCallback): void {
     this.callbacks.add(callback);
     this.logger.debug('Added new deposit callback handler');
   }
 
+  /**
+   * Remove a previously registered callback
+   */
   public removeCallback(callback: DepositCallback): void {
     this.callbacks.delete(callback);
     this.logger.debug('Removed deposit callback handler');
   }
 
+  /**
+   * Notify all callbacks about a deposit
+   */
   private async notifyCallbacks(event: DepositEvent): Promise<void> {
     this.logger.debug('Notifying callbacks of new deposit event', event);
-    for (const callback of this.callbacks) {
+    for (const cb of this.callbacks) {
       try {
-        await callback(event);
+        await cb(event);
       } catch (error) {
         this.logger.error('Error in deposit callback:', error);
       }
@@ -104,21 +150,316 @@ export class SeiDepositMonitor {
   }
 
   /**
-   * Parses transaction logs to find any deposits to `this.targetAddress` or `this.castAddress`.
-   * Returns an array because a single Tx can deposit to your address multiple times.
+   * start monitoring
+   * - If targetAddress is 0x, we resolve it (contract => cast, EOA => possible cast, known wallet => use final).
+   * - Then we open WS and REST polling to detect deposits.
    */
-  private parseTransactionDetails(tx: any): TransactionDetails[] {
-    this.logger.trace('Parsing transaction details', tx);
+  public async start(): Promise<void> {
+    if (this.isMonitoring) {
+      this.logger.warn('Monitor already running');
+      return;
+    }
 
+    // for hex address, we may want to resolve
+    if (AddressUtils.isEthAddress(this.targetAddress)) {
+      this.logger.info(`Address ${this.targetAddress} is EVM. Resolving...`);
+      this.finalAddress = await this.resolveEvmAddress(this.targetAddress);
+      this.logger.info(`Resolved => final address = ${this.finalAddress}`);
+    } else {
+      this.logger.info(`Using direct bech32 address => ${this.finalAddress}`);
+    }
+
+    this.isMonitoring = true;
+    this.logger.info('Starting deposit monitor...');
+
+    await this.startWebSocket();
+    this.startRestPolling();
+  }
+
+  /**
+   * Stop the monitor gracefully
+   */
+  public stop(): void {
+    this.logger.info('Stopping deposit monitor');
+    this.isMonitoring = false;
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    this.logger.debug('Monitor stopped successfully');
+  }
+
+  // -----------------------------------------------
+  //   EVM Address Resolution (contract vs. EOA)
+  // -----------------------------------------------
+  private async resolveEvmAddress(hexAddr: string): Promise<string> {
+    const evmRpc = this.config.evmRpcEndpoint || 'https://evm-rpc.sei.basementnodes.ca';
+    this.logger.debug(`resolveEvmAddress => Checking code at ${hexAddr}`);
+    const code = await this.ethGetCode(evmRpc, hexAddr);
+
+    // if code != '0x', it’s a contract => cast
+    if (code && code !== '0x') {
+      this.logger.debug('Detected contract => cast to bech32');
+      return AddressUtils.ethAddressToBech32(hexAddr, this.config.prefix);
+    }
+
+    // else EOA => check transaction count
+    const txCountHex = await this.ethGetTransactionCount(evmRpc, hexAddr);
+    const txCount = parseInt(txCountHex, 16) || 0;
+    this.logger.debug(`EOA => txCount = ${txCount}`);
+
+    // ifinal wallet known, use that
+    const chainWallet = await this.lookupChainWallet(hexAddr);
+    if (chainWallet) {
+      // known final address
+      this.logger.debug(`Chain wallet found => ${chainWallet}`);
+      return chainWallet;
+    }
+
+    // if new EOA => cast until first tx signed
+    if (txCount === 0) {
+      this.logger.warn('EOA brand-new => casting address');
+      return AddressUtils.ethAddressToBech32(hexAddr, this.config.prefix);
+    }
+
+    // has txCount but no chain mapping => fallback to cast or error
+    this.logger.warn('EOA has tx but no chain mapping => fallback cast');
+    return AddressUtils.ethAddressToBech32(hexAddr, this.config.prefix);
+  }
+
+  private async ethGetCode(rpc: string, address: string): Promise<string | null> {
+    try {
+      const body = {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getCode',
+        params: [address, 'latest']
+      };
+      const resp = await fetch(rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+  
+      // Use our newly-defined JSON-RPC response type
+      const data = (await resp.json()) as JsonRpcResponse<string>;
+  
+      // Optional: handle RPC errors
+      if (data.error) {
+        this.logger.error(`eth_getCode error: ${data.error.message}`, data.error);
+        return null;
+      }
+  
+      // If no error, return the 'result' (e.g. "0x" or "0x6080...")
+      return data.result || null;
+    } catch (error) {
+      this.logger.error('eth_getCode failed', error);
+      return null;
+    }
+  }
+  
+  private async ethGetTransactionCount(rpc: string, address: string): Promise<string> {
+    try {
+      const body = {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getTransactionCount',
+        params: [address, 'latest']
+      };
+      const resp = await fetch(rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+  
+      const data = (await resp.json()) as JsonRpcResponse<string>;
+  
+      if (data.error) {
+        this.logger.error(`eth_getTransactionCount error: ${data.error.message}`, data.error);
+        // fallback to '0x0' if there's an error
+        return '0x0';
+      }
+  
+      return data.result || '0x0';
+    } catch (error) {
+      this.logger.error('eth_getTransactionCount failed', error);
+      return '0x0';
+    }
+  }
+  
+  /**
+   * Looks up the final chain wallet from the wallets.sei.basementnodes.ca service
+   */
+  private async lookupChainWallet(hexAddr: string): Promise<string | null> {
+    try {
+      const url = `https://wallets.sei.basementnodes.ca/${hexAddr}`;
+      this.logger.debug(`lookupChainWallet => ${url}`);
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        return null;
+      }
+      const data = (await resp.json()) as WalletsLookup;
+      return data.result || null;
+    } catch (error) {
+      this.logger.error('lookupChainWallet failed', error);
+      return null;
+    }
+  }
+
+  // ------------------------------------------
+  //     WebSocket Monitoring
+  // ------------------------------------------
+  private async startWebSocket(): Promise<void> {
+    try {
+      this.logger.debug(`Connecting to WS => ${this.config.wsEndpoint}`);
+      this.ws = new WebSocket(this.config.wsEndpoint);
+
+      this.ws.on('open', () => {
+        this.logger.info('WebSocket connected');
+        const subscription = {
+          jsonrpc: '2.0',
+          method: 'subscribe',
+          id: 1,
+          params: {
+            query: "tm.event='Tx'"
+          }
+        };
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(subscription));
+          this.logger.debug('Sent subscribe request', subscription);
+        }
+      });
+
+      this.ws.on('message', async (data: WebSocket.Data) => {
+        try {
+          const response = JSON.parse(data.toString());
+          this.logger.trace('WS message', response);
+
+          // cast response to any so TS doesn't complain about .result
+          const maybeTxResult = (response as any)?.result?.data?.value?.TxResult;
+          if (maybeTxResult) {
+            this.logger.debug('WS TxResult =>', maybeTxResult);
+            const depositDetails = this.parseTransactionDetails(maybeTxResult);
+            if (depositDetails.length) {
+              for (const detail of depositDetails) {
+                const event: DepositEvent = {
+                  type: this.determineDepositType(detail),
+                  transaction: detail
+                };
+                this.logger.info('New deposit (WS)', event);
+                await this.notifyCallbacks(event);
+              }
+            }
+          }
+        } catch (err) {
+          this.logger.error('Error processing WS message:', err);
+        }
+      });
+
+      this.ws.on('error', (err: Error) => {
+        this.logger.error('WebSocket error:', err);
+        this.reconnect();
+      });
+
+      this.ws.on('close', () => {
+        this.logger.warn('WebSocket closed, reconnecting...');
+        this.reconnect();
+      });
+    } catch (error) {
+      this.logger.error('startWebSocket error:', error);
+      this.reconnect();
+    }
+  }
+
+  private reconnect(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+    this.reconnectTimeout = setTimeout(() => {
+      if (this.isMonitoring) {
+        this.logger.info('Reconnecting WebSocket...');
+        this.startWebSocket();
+      }
+    }, 5000);
+  }
+
+  // ------------------------------------------
+  //     REST Polling Fallback
+  // ------------------------------------------
+  private async startRestPolling(): Promise<void> {
+    this.logger.info('Starting REST polling...');
+    let lastCheckedBlock = await this.getLatestBlockHeight();
+    this.logger.debug('Initial block height =>', lastCheckedBlock);
+
+    const poll = async () => {
+      if (!this.isMonitoring) return;
+
+      try {
+        const currentHeight = await this.getLatestBlockHeight();
+        this.logger.trace('Polling block height =>', { current: currentHeight, last: lastCheckedBlock });
+
+        if (currentHeight > lastCheckedBlock) {
+          this.logger.debug('New blocks detected =>', { from: lastCheckedBlock + 1, to: currentHeight });
+
+          const txs = await this.getTransactions(lastCheckedBlock + 1, currentHeight);
+          this.logger.debug(`Fetched ${txs.length} transaction(s)`);
+          for (const tx of txs) {
+            const depositDetails = this.parseTransactionDetails(tx);
+            if (depositDetails.length) {
+              for (const detail of depositDetails) {
+                const event: DepositEvent = {
+                  type: this.determineDepositType(detail),
+                  transaction: detail
+                };
+                this.logger.info('New deposit (REST)', event);
+                await this.notifyCallbacks(event);
+              }
+            }
+          }
+          lastCheckedBlock = currentHeight;
+        }
+      } catch (err) {
+        this.logger.error('REST polling error:', err);
+      }
+      setTimeout(poll, 6000);
+    };
+
+    poll();
+  }
+
+  private async getLatestBlockHeight(): Promise<number> {
+    const url = `${this.config.restEndpoint}/blocks/latest`;
+    const resp = await fetch(url);
+    const data = (await resp.json()) as BlockResponse;
+    return parseInt(data.block.header.height, 10);
+  }
+
+  private async getTransactions(fromBlock: number, toBlock: number): Promise<TxResponseItem[]> {
+    // watch coin_received.receiver = finalAddress
+    const query = `coin_received.receiver='${this.finalAddress}'`;
+    const url = `${this.config.restEndpoint}/cosmos/tx/v1beta1/txs?events=${encodeURIComponent(query)}&pagination.limit=100`;
+    this.logger.debug('getTransactions =>', { fromBlock, toBlock, url });
+    const resp = await fetch(url);
+    const data = (await resp.json()) as TxResponse;
+    return data.tx_responses || [];
+  }
+
+  // ------------------------------------------
+  //     Parsing transaction logs
+  // ------------------------------------------
+  private parseTransactionDetails(tx: TxResponseItem): TransactionDetails[] {
+    this.logger.trace('parseTransactionDetails =>', tx);
     const depositDetails: TransactionDetails[] = [];
 
-    // If this is from REST, we usually see logs at tx.logs.
-    // If from WS (Tendermint), sometimes we see them under tx.result.events, etc.
-    // We'll unify by first checking tx.logs if available:
+    // logs from REST or might be undefined
     const logs = tx.logs || [];
-    // If no logs, try to see if we have direct events from the WS shape:
+
+    // WS data might have tx.result, so cast or safely check:
     if (!logs.length && tx.result?.events) {
-      // We'll simulate a single log with these events
       logs.push({
         msg_index: 0,
         log: '',
@@ -128,29 +469,22 @@ export class SeiDepositMonitor {
 
     for (const log of logs) {
       const events = log.events || [];
-      // We also want to figure out which action was used in this message.
-      // Usually found in a "message" event => attribute key = "action"
+
+      // identify messageType /cosmos.bank... or /seiprotocol.seichain.evm...
       let actionType = 'unknown';
-      const messageEvent = events.find((e: { type: string; }) => e.type === 'message');
-      if (messageEvent && messageEvent.attributes) {
-        const actionAttr = messageEvent.attributes.find((a: { key: string; }) => a.key === 'action');
+      const messageEvent = events.find((e) => e.type === 'message');
+      if (messageEvent) {
+        const actionAttr = messageEvent.attributes.find((a) => a.key === 'action');
         if (actionAttr) {
           actionType = actionAttr.value;
         }
       }
 
-      // Look for coin_received events
-      const coinReceivedEvents = events.filter((e: { type: string; }) => e.type === 'coin_received');
+      // coin_received (may include multiple pairs)
+      const coinReceivedEvents = events.filter((e) => e.type === 'coin_received');
       for (const cre of coinReceivedEvents) {
         const attrs = cre.attributes || [];
-        // A single coin_received can have multiple (receiver, amount) pairs in one array
-        // Example:
-        // [
-        //   { key: 'receiver', value: 'sei1abc...' },
-        //   { key: 'amount',   value: '100000usei' },
-        //   { key: 'receiver', value: 'sei1xyz...' },
-        //   { key: 'amount',   value: '23usei' },
-        // ]
+        // multiple (receiver, amount) pairs in a single coin_received
         for (let i = 0; i < attrs.length; i += 2) {
           const receiverAttr = attrs[i];
           const amountAttr = attrs[i + 1];
@@ -159,12 +493,12 @@ export class SeiDepositMonitor {
 
           const receiver = receiverAttr.value;
           const amount = amountAttr.value;
-          // Check if this deposit is for our target or cast address
-          if (receiver === this.targetAddress || receiver === this.castAddress) {
+
+          if (receiver === this.finalAddress) {
             const detail: TransactionDetails = {
-              hash: tx.txhash || tx.hash,
+              hash: tx.txhash,
               height: tx.height,
-              type: actionType, // We'll store the raw "action" here
+              type: actionType,
               amount,
               receiver,
               sender: this.extractSender(events),
@@ -179,21 +513,16 @@ export class SeiDepositMonitor {
       }
     }
 
-    this.logger.trace('Parsed deposit details', depositDetails);
     return depositDetails;
   }
 
-  /**
-   * Helper to find a "sender" in the events.
-   */
-  private extractSender(events: Array<{ type: string; attributes: Array<{ key: string; value: string }> }>): string | undefined {
-    // First try the "message" event
-    const messageEvent = events.find((e) => e.type === 'message');
-    if (messageEvent) {
-      const senderAttr = messageEvent.attributes.find((a) => a.key === 'sender');
+  private extractSender(events: TxLogEvent[]): string | undefined {
+    // check 'message' or 'transfer' for desired attribute key(s)
+    const msgEvent = events.find((e) => e.type === 'message');
+    if (msgEvent) {
+      const senderAttr = msgEvent.attributes.find((a) => a.key === 'sender');
       if (senderAttr) return senderAttr.value;
     }
-    // If not found, maybe it's in "transfer"
     const transferEvent = events.find((e) => e.type === 'transfer');
     if (transferEvent) {
       const senderAttr = transferEvent.attributes.find((a) => a.key === 'sender');
@@ -203,194 +532,23 @@ export class SeiDepositMonitor {
   }
 
   /**
-   * Determines whether a parsed deposit is 'direct', 'evm', or 'cast'.
+   * Determine deposit type: 'evm', 'direct', or 'cast'
+   *
+   * - EVM: if action is '/seiprotocol.seichain.evm.MsgEVMTransaction'
+   * - direct: normal bank send
+   * - cast: If you specifically want to identify a “cast address” deposit
+   *   (maybe by comparing to a known cast address or logic),
+   *   you could implement that check here.
    */
   private determineDepositType(details: TransactionDetails): 'direct' | 'evm' | 'cast' {
-    // If deposit is going to the cast address, treat as 'cast'
-    if (details.receiver === this.castAddress) {
-      this.logger.debug('Identified cast address deposit', { receiver: details.receiver });
-      return 'cast';
-    }
-    // If the action is EVM
     if (details.type === '/seiprotocol.seichain.evm.MsgEVMTransaction') {
-      this.logger.debug('Identified EVM transaction', { type: details.type });
+      this.logger.debug('EVM deposit identified');
       return 'evm';
     }
-    // Otherwise default to direct
-    this.logger.debug('Identified direct deposit', { type: details.type });
+    // If you have logic to detect a brand-new EOA deposit, you could do so:
+    // if (details.receiver === this.castAddress) { return 'cast'; }
+
+    this.logger.debug('Direct deposit identified');
     return 'direct';
-  }
-
-  public async start(): Promise<void> {
-    if (this.isMonitoring) {
-      this.logger.warn('Monitor already running');
-      return;
-    }
-
-    this.isMonitoring = true;
-    this.logger.info('Starting deposit monitor');
-
-    // Start both WebSocket and REST monitoring for comprehensive coverage
-    await this.startWebSocket();
-    this.startRestPolling();
-  }
-
-  private async startWebSocket(): Promise<void> {
-    try {
-      this.logger.debug(`Connecting to WebSocket endpoint: ${this.config.wsEndpoint}`);
-      this.ws = new WebSocket(this.config.wsEndpoint);
-
-      this.ws.on('open', () => {
-        this.logger.info('WebSocket connected successfully');
-        const subscription = {
-          jsonrpc: '2.0',
-          method: 'subscribe',
-          id: 1,
-          params: {
-            query: "tm.event='Tx'"
-          }
-        };
-
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify(subscription));
-          this.logger.debug('Sent subscription request', subscription);
-        }
-      });
-
-      this.ws.on('message', async (data: WebSocket.Data) => {
-        try {
-          const response = JSON.parse(data.toString());
-          this.logger.trace('Received WebSocket message', response);
-
-          // Check if there's a TxResult
-          if (response.result?.data?.value?.TxResult) {
-            const txResult = response.result.data.value.TxResult;
-            this.logger.debug('Processing transaction result', txResult);
-
-            // parseTransactionDetails returns an array
-            const depositDetails = this.parseTransactionDetails(txResult);
-            if (depositDetails.length) {
-              for (const details of depositDetails) {
-                const event: DepositEvent = {
-                  type: this.determineDepositType(details),
-                  transaction: details
-                };
-                this.logger.info('New deposit detected (WS)', event);
-                await this.notifyCallbacks(event);
-              }
-            }
-          }
-        } catch (error) {
-          this.logger.error('Error processing WebSocket message:', error);
-        }
-      });
-
-      this.ws.on('error', (error: Error) => {
-        this.logger.error('WebSocket error:', error);
-        this.reconnect();
-      });
-
-      this.ws.on('close', () => {
-        this.logger.warn('WebSocket connection closed, attempting to reconnect...');
-        this.reconnect();
-      });
-    } catch (error) {
-      this.logger.error('Error setting up WebSocket:', error);
-      this.reconnect();
-    }
-  }
-
-  private reconnect(): void {
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-    }
-
-    this.reconnectTimeout = setTimeout(() => {
-      if (this.isMonitoring) {
-        this.logger.info('Attempting to reconnect WebSocket');
-        this.startWebSocket();
-      }
-    }, 5000);
-  }
-
-  private async startRestPolling(): Promise<void> {
-    this.logger.info('Starting REST polling');
-    let lastCheckedBlock = await this.getLatestBlockHeight();
-    this.logger.debug('Initial block height', { height: lastCheckedBlock });
-
-    const poll = async () => {
-      if (!this.isMonitoring) return;
-
-      try {
-        const currentHeight = await this.getLatestBlockHeight();
-        this.logger.trace('Polling block height', { current: currentHeight, last: lastCheckedBlock });
-
-        if (currentHeight > lastCheckedBlock) {
-          this.logger.debug('New blocks detected', {
-            from: lastCheckedBlock + 1,
-            to: currentHeight
-          });
-
-          const transactions = await this.getTransactions(lastCheckedBlock + 1, currentHeight);
-          this.logger.debug(`Found ${transactions.length} transactions`);
-
-          for (const tx of transactions) {
-            // parseTransactionDetails returns an array
-            const depositDetails = this.parseTransactionDetails(tx);
-            if (depositDetails.length) {
-              for (const details of depositDetails) {
-                const event: DepositEvent = {
-                  type: this.determineDepositType(details),
-                  transaction: details
-                };
-                this.logger.info('New deposit detected via REST', event);
-                await this.notifyCallbacks(event);
-              }
-            }
-          }
-
-          lastCheckedBlock = currentHeight;
-        }
-      } catch (error) {
-        this.logger.error('Error in REST polling:', error);
-      }
-
-      setTimeout(poll, 6000);
-    };
-
-    poll();
-  }
-
-  private async getLatestBlockHeight(): Promise<number> {
-    const response = await fetch(`${this.config.restEndpoint}/blocks/latest`);
-    const data = (await response.json()) as BlockResponse;
-    return parseInt(data.block.header.height);
-  }
-
-  private async getTransactions(fromBlock: number, toBlock: number): Promise<any[]> {
-    // We look for coin_received.receiver = your target or cast address.
-    // Adjust if your chain uses 'transfer.recipient' or anything else.
-    const query = `coin_received.receiver='${this.targetAddress}'${this.castAddress ? ` OR coin_received.receiver='${this.castAddress}'` : ''}`;
-    const url = `${this.config.restEndpoint}/cosmos/tx/v1beta1/txs?events=${encodeURIComponent(query)}&pagination.limit=100`;
-
-    this.logger.debug('Fetching transactions', { url, fromBlock, toBlock });
-
-    const response = await fetch(url);
-    const data = (await response.json()) as TxResponse;
-    return data.tx_responses || [];
-  }
-
-  public stop(): void {
-    this.logger.info('Stopping deposit monitor');
-    this.isMonitoring = false;
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
-    this.logger.debug('Monitor stopped successfully');
   }
 }

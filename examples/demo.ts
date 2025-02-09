@@ -1,15 +1,20 @@
-// demo.ts
-import { SeiDepositMonitor, DepositEvent } from '../dist';
+// examples/demo.ts
+
+import { SeiDepositMonitor, DepositEvent, LogLevel } from '../dist'; 
+// Or if you're running locally without building first, adjust to: 
+// import { SeiDepositMonitor, DepositEvent, LogLevel } from '../src';
 
 async function main() {
-    // Initialize the monitor
+    // Initialize the monitor with chosen log level (DEBUG for more verbosity, for example)
     const monitor = new SeiDepositMonitor(
         {
             wsEndpoint: 'wss://ws.sei.basementnodes.ca/websocket',
             restEndpoint: 'https://api.sei.basementnodes.ca',
-            prefix: 'sei'
+            prefix: 'sei',
+            logLevel: LogLevel.DEBUG
         },
-        'sei1qv45ek49hqupx63u8lme9vcylarj3qe7f7cy99' // Your target address
+        // Either a bech32 address or a 0x address:
+        'sei1qv45ek49hqupx63u8lme9vcylarj3qe7f7cy99'
     );
 
     // Add deposit handler
@@ -21,12 +26,12 @@ async function main() {
         console.log('From:', event.transaction.sender);
         console.log('Block Height:', event.transaction.height);
         console.log('Timestamp:', event.transaction.timestamp);
-        
+
         // Additional type-specific logging
         if (event.type === 'evm') {
-            console.log('EVM Transaction');
+            console.log('EVM Transaction deposit detected!');
         } else if (event.type === 'cast') {
-            console.log('Cast Address Deposit');
+            console.log('Cast Address Deposit (for brand-new EOA)!');
         }
     });
 
@@ -34,7 +39,7 @@ async function main() {
     console.log('Starting deposit monitor...');
     await monitor.start();
 
-    // Keep the process running
+    // Keep the process running until Ctrl-C
     process.on('SIGINT', () => {
         console.log('Shutting down...');
         monitor.stop();

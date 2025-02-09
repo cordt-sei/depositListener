@@ -2,4 +2,5 @@
 
 export { SeiDepositMonitor } from './monitor';
 export { AddressUtils } from './address';
-export * from './types';
+export { Logger, LogLevel } from './logger';
+export type { MonitorConfig, DepositEvent, TransactionDetails } from './types';
